@@ -1,437 +1,214 @@
-# =============================================
-# Lift AUC for XGBoost / LightGBM / MLP on Lending Club
-# - Trees use UN-SCALED features
-# - MLP uses SCALED features
-# - Early stopping on a 90/10 refit split from FULL train (no final fixed-round refit)
-# - Memory-safe LightGBM fallback only if OOM
-# =============================================
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score, f1_score, roc_auc_score
+import scipy.stats as sps
 
-import warnings, os, numpy as np, pandas as pd, matplotlib.pyplot as plt
-from sklearn.exceptions import ConvergenceWarning
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
-os.environ.setdefault("OMP_NUM_THREADS", "8")
 
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve, confusion_matrix
-from sklearn.utils import check_random_state
+# Confusion Matrix Plotting Function
+def plot_confusion_matrix(mean_conf_matrix, xtick_labels=None, ytick_labels=None):
+    """
+    Plot the confusion matrix as a heatmap.
+    """
+    fig, axes = plt.subplots(figsize=(8, 6))
+    ax = sns.heatmap(mean_conf_matrix.T, annot=True, cmap='Blues', fmt=".1f", annot_kws={"size": 18})
+    if xtick_labels:
+        ax.set_xticklabels(xtick_labels)
+    if ytick_labels:
+        ax.set_yticklabels(ytick_labels)
 
-from xgboost import XGBClassifier
-import xgboost as xgb
-from lightgbm import LGBMClassifier
-import lightgbm as lgb
-from lightgbm.basic import LightGBMError
+    ax.set_xlabel('True Label')
+    ax.set_ylabel('Predicted Label')
+    plt.title('Mean Confusion Matrix')
+    plt.show()
 
+# Function to Calculate Metrics
+def calculate_scores(model, X_trn, y_trn, X_tst, y_tst):
+    """
+    Train a model and calculate various performance metrics on the test set.
+    """
+    model.fit(X_trn, y_trn)
+    y_pred = model.predict(X_tst)
+    accuracy = accuracy_score(y_tst, y_pred)
+
+    # Confusion matrix
+    conf_matrix = confusion_matrix(y_tst, y_pred)
+
+    # Precision, recall, F1-score
+    precision = precision_score(y_tst, y_pred)
+    recall = recall_score(y_tst, y_pred)
+    f1 = f1_score(y_tst, y_pred)
+
+    # AUC score
+    y_pred_proba = model.predict_proba(X_tst)[:, 1]
+    auc = roc_auc_score(y_tst, y_pred_proba)
+
+    # KS statistic
+    mask = y_tst.astype(bool).values
+    churn = y_pred_proba[mask]
+    not_churn = y_pred_proba[~mask]
+    ks = sps.ks_2samp(churn, not_churn)[0]
+
+    return accuracy, auc, ks, conf_matrix, precision, recall, f1
+
+# Function to Evaluate Models
+def fit_models_summary(models, X_train, y_train, X_test, y_test):
+    """
+    Evaluate multiple models on pre-split training and testing data.
+    """
+    results = []
+    for name, model in models.items():
+        print(f"Evaluating {name}...")
+        accuracy, auc, ks, conf_matrix, precision, recall, f1 = calculate_scores(model, X_train, y_train, X_test, y_test)
+
+        # Store results
+        results.append({'Model': name, 'Accuracy': accuracy, 'AUC': auc, 'KS': ks, 
+                        'Precision': precision, 'Recall': recall, 'F1-Score': f1})
+        print(f"Model: {name}")
+        print(f"Confusion Matrix:\n{conf_matrix}\n")
+
+    return pd.DataFrame(results)
+
+# Define Models
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.neural_network import MLPClassifier
 from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neural_network import MLPClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 
-try:
-    from sklearn.ensemble import HistGradientBoostingClassifier
-except Exception:
-    from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
-    from sklearn.ensemble import HistGradientBoostingClassifier
-
-SEED = 123
-rng = check_random_state(SEED)
-
-# -----------------
-# knobs
-# -----------------
-XGB_TRIALS  = 6
-LGBM_TRIALS = 6
-N_FOLDS     = 3
-TUNE_MAX_ROWS = 180_000       # subsample for tuning
-HGB_TUNE_ROWS = 120_000       # small subset for quick HGB/MLP scan
-
-# -----------------
-# helpers
-# -----------------
-def _has_iloc(obj): return hasattr(obj, "iloc")
-def _take(obj, idx): return obj.iloc[idx] if _has_iloc(obj) else obj[idx]
-def _astype32(Z):
-    try: return Z.astype(np.float32, copy=False)
-    except Exception: return np.asarray(Z, dtype=np.float32)
-def _asfloat32_contig(X): return np.ascontiguousarray(_astype32(X))
-def _stratified_subsample(X, y, n_max=180_000, seed=42):
-    n = len(y)
-    if n <= n_max: return X, y
-    rs = check_random_state(seed)
-    y_arr = np.asarray(y)
-    idx_all = np.arange(n, dtype=int)
-    keep = []
-    for cls in np.unique(y_arr):
-        idx_cls = idx_all[y_arr == cls]
-        k = max(1, int(round(len(idx_cls) / n * n_max)))
-        keep.append(rs.choice(idx_cls, size=min(k, len(idx_cls)), replace=False))
-    idx_keep = np.concatenate(keep)
-    if len(idx_keep) > n_max:
-        idx_keep = rs.choice(idx_keep, size=n_max, replace=False)
-    return _take(X, idx_keep), _take(y, idx_keep)
-def _sample_loguniform(rs, lo, hi): return float(np.exp(rs.uniform(np.log(lo), np.log(hi))))
-
-# -----------------
-# XGBoost tuner (on UNscaled data)
-# -----------------
-def cv_select_xgb(X, y, seed=SEED, trials=XGB_TRIALS, sample_max=TUNE_MAX_ROWS,
-                  num_boost_round=2500, es_rounds=100, nfold=N_FOLDS):
-    rs = check_random_state(seed)
-    Xs, ys = _stratified_subsample(X, y, n_max=sample_max, seed=seed)
-    Xs = _asfloat32_contig(Xs); ys = np.asarray(ys, dtype=np.float32)
-    dtrain = xgb.DMatrix(Xs, label=ys)
-
-    def sample_params():
-        return dict(
-            eta=_sample_loguniform(rs, 0.03, 0.10),
-            max_depth=int(rs.randint(5, 9)),                 # 5..8 (slightly deeper)
-            min_child_weight=_sample_loguniform(rs, 1.0, 8.0),
-            subsample=float(rs.uniform(0.75, 1.0)),
-            colsample_bytree=float(rs.uniform(0.7, 1.0)),
-            reg_alpha=_sample_loguniform(rs, 1e-8, 0.5),
-            reg_lambda=_sample_loguniform(rs, 1e-3, 10.0),
-            gamma=_sample_loguniform(rs, 1e-8, 1.0),
-        )
-
-    best = None
-    for _ in range(trials):
-        p = sample_params()
-        params = dict(objective="binary:logistic", eval_metric="auc", tree_method="hist",
-                      nthread=min(8, os.cpu_count() or 8), seed=seed, **p)
-        cv = xgb.cv(params, dtrain, num_boost_round=num_boost_round, nfold=nfold,
-                    stratified=True, early_stopping_rounds=es_rounds, verbose_eval=False, seed=seed)
-        rounds = len(cv); auc = float(cv["test-auc-mean"].iloc[-1])
-        if (best is None) or (auc > best[0]): best = (auc, p, rounds)
-
-    _, p, rounds = best
-    return dict(
-        learning_rate=p["eta"], max_depth=p["max_depth"], min_child_weight=p["min_child_weight"],
-        subsample=p["subsample"], colsample_bytree=p["colsample_bytree"],
-        reg_alpha=p["reg_alpha"], reg_lambda=p["reg_lambda"], gamma=p["gamma"],
-        tree_method="hist", eval_metric="auc", n_estimators=int(rounds * 1.06)
-    )
-
-# -----------------
-# LightGBM tuner (on UNscaled data, version-safe ES)
-# -----------------
-def cv_select_lgbm(X, y, seed=SEED, trials=LGBM_TRIALS, sample_max=TUNE_MAX_ROWS,
-                   max_rounds=5000, es_rounds=120, nfold=N_FOLDS):
-    rs = check_random_state(seed)
-    Xs, ys = _stratified_subsample(X, y, n_max=sample_max, seed=seed)
-    Xs = _asfloat32_contig(Xs); ys = np.asarray(ys)
-
-    def sample_params():
-        return dict(
-            learning_rate=_sample_loguniform(rs, 0.02, 0.10),
-            num_leaves=int(rs.randint(96, 385)),          # allow capacity
-            max_depth=-1,
-            min_child_samples=int(rs.randint(40, 201)),   # not too tiny leaves
-            colsample_bytree=float(rs.uniform(0.7, 1.0)),
-            subsample=float(rs.uniform(0.7, 1.0)),
-            subsample_freq=1,
-            reg_alpha=_sample_loguniform(rs, 1e-8, 0.5),
-            reg_lambda=_sample_loguniform(rs, 1e-3, 20.0),
-            min_split_gain=_sample_loguniform(rs, 1e-8, 0.2),
-            max_bin=255, boosting_type="gbdt"
-        )
-
-    best = None
-    for _ in range(trials):
-        p = sample_params()
-        skf = StratifiedKFold(n_splits=nfold, shuffle=True, random_state=seed)
-        aucs, iters = [], []
-        for tr_idx, va_idx in skf.split(np.zeros(len(ys)), ys):
-            X_tr, X_va = _take(Xs, tr_idx), _take(Xs, va_idx)
-            y_tr, y_va = _take(ys, tr_idx), _take(ys, va_idx)
-            mdl = LGBMClassifier(objective="binary", n_estimators=max_rounds, random_state=seed,
-                                 n_jobs=min(8, os.cpu_count() or 8), **p)
-            tried=False
-            try:
-                es_cb = lgb.early_stopping(es_rounds, first_metric_only=False, verbose=False)
-                mdl.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], eval_metric="auc",
-                        callbacks=[es_cb], verbose=False); tried=True
-            except Exception: pass
-            if not tried:
-                try:
-                    mdl.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], eval_metric="auc",
-                            early_stopping_rounds=es_rounds, verbose=False); tried=True
-                except TypeError:
-                    mdl.fit(X_tr, y_tr)
-            proba = mdl.predict_proba(X_va)[:, 1]
-            aucs.append(roc_auc_score(y_va, proba))
-            iters.append(int(getattr(mdl, "best_iteration_", None) or max_rounds))
-        mean_auc = float(np.mean(aucs)); rounds = int(max(50, np.median(iters)))
-        if (best is None) or (mean_auc > best[0]): best = (mean_auc, p, rounds)
-
-    _, p, rounds = best
-    return dict(
-        learning_rate=p["learning_rate"], num_leaves=p["num_leaves"], max_depth=p["max_depth"],
-        min_child_samples=p["min_child_samples"], colsample_bytree=p["colsample_bytree"],
-        subsample=p["subsample"], subsample_freq=p["subsample_freq"], reg_alpha=p["reg_alpha"],
-        reg_lambda=p["reg_lambda"], min_split_gain=p["min_split_gain"], max_bin=p["max_bin"],
-        boosting_type=p["boosting_type"], n_estimators=int(rounds * 1.06),
-        objective="binary", random_state=seed, n_jobs=min(8, os.cpu_count() or 8)
-    )
-
-# -----------------
-# quick tuners for HGB / MLP (MLP uses SCALED)
-# -----------------
-def tune_hgb_fast(X, y, seed=SEED, n_trials=5, stage1=200, stage2=800):
-    rs = check_random_state(seed)
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=seed)
-    tr_idx, va_idx = next(sss.split(np.zeros(len(y)), np.asarray(y)))
-    X_tr, y_tr = _take(X, tr_idx), _take(y, tr_idx)
-    X_va, y_va = _take(X, va_idx), _take(y, va_idx)
-    X_tr = _asfloat32_contig(X_tr); X_va = _asfloat32_contig(X_va)
-
-    def sample(max_iter):
-        return dict(max_iter=max_iter, learning_rate=_sample_loguniform(rs, 0.05, 0.2),
-                    max_depth=int(rs.randint(2, 7)), min_samples_leaf=int(rs.randint(10, 101)),
-                    l2_regularization=_sample_loguniform(rs, 1e-8, 1.0), max_bins=255,
-                    early_stopping=True, validation_fraction=0.1)
-    cand=[]
-    for _ in range(n_trials):
-        p = sample(stage1)
-        m = HistGradientBoostingClassifier(**p, random_state=seed).fit(X_tr, y_tr)
-        auc = roc_auc_score(y_va, m.predict_proba(X_va)[:, 1]); cand.append((auc, p))
-    cand.sort(reverse=True, key=lambda t: t[0]); _, p = cand[0]
-    p2 = sample(stage2); p2.update({k:v for k,v in p.items() if k!="max_iter"})
-    return HistGradientBoostingClassifier(**p2, random_state=seed).fit(X_tr, y_tr)
-
-def tune_mlp_fast(X_scaled, y, seed=SEED, n_trials=6):
-    rs = check_random_state(seed)
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=seed)
-    tr_idx, va_idx = next(sss.split(np.zeros(len(y)), np.asarray(y)))
-    X_tr, y_tr = _take(X_scaled, tr_idx), _take(y, tr_idx)
-    X_va, y_va = _take(X_scaled, va_idx), _take(y, va_idx)
-    best=None
-    for _ in range(n_trials):
-        params = dict(
-            hidden_layer_sizes=[(256,128,64),(128,64,32)][int(rs.randint(0,2))],
-            alpha=_sample_loguniform(rs, 1e-5, 1e-3),
-            batch_size=int([512,1024][int(rs.randint(0,2))]),
-            learning_rate_init=_sample_loguniform(rs, 1e-4, 3e-3),
-            tol=1e-3, validation_fraction=0.12
-        )
-        m = MLPClassifier(solver="adam", activation="relu", early_stopping=True,
-                          n_iter_no_change=8, max_iter=80, random_state=seed, **params).fit(X_tr, y_tr)
-        auc = roc_auc_score(y_va, m.predict_proba(X_va)[:, 1])
-        if (best is None) or (auc > best[0]): best=(auc,m)
-    return best[1]
-
-# -----------------
-# build tuned models (trees on UNscaled; MLP on SCALED)
-# -----------------
-def build_tuned_models(X_train_tree, y_train, X_train_scaled, seed=SEED):
-    print("Tuning XGBoost (unscaled)...")
-    xgb_params = cv_select_xgb(X_train_tree, y_train, seed=seed)
-    print("Tuning LightGBM (unscaled)...")
-    lgb_params = cv_select_lgbm(X_train_tree, y_train, seed=seed)
-    print("Tuning HGB/MLP on subset...")
-    X_sub, y_sub = _stratified_subsample(X_train_tree, y_train, n_max=HGB_TUNE_ROWS, seed=seed)
-    hgb = tune_hgb_fast(X_sub, y_sub, seed=seed)
-    mlp = tune_mlp_fast(X_train_scaled, y_train, seed=seed)
-    return {
-        "XGBoost": XGBClassifier(random_state=seed, **xgb_params),
-        "Light GBM": LGBMClassifier(**lgb_params),
-        "Gradient Boosting": hgb,
-        "Neural Network": mlp
-    }
-
-# -----------------
-# REFIT with early stopping on a 90/10 split from FULL train (keeps the ES model)
-# -----------------
-def refit_with_es(models, X_train_tree, X_train_scaled, y_train, seed=SEED):
-    # split once for ES
-    tr_idx, va_idx = train_test_split(np.arange(len(y_train)), test_size=0.10,
-                                      stratify=y_train, random_state=seed)
-    Xtr_tree, Xva_tree = _take(X_train_tree, tr_idx), _take(X_train_tree, va_idx)
-    ytr, yva = _take(y_train, tr_idx), _take(y_train, va_idx)
-    Xtr_tree = _asfloat32_contig(Xtr_tree); Xva_tree = _asfloat32_contig(Xva_tree)
-
-    Xtr_s, Xva_s = _take(X_train_scaled, tr_idx), _take(X_train_scaled, va_idx)
-
-    out = {}
-
-    # XGBoost
-    p = models["XGBoost"].get_params().copy(); p["random_state"]=seed
-    xgb_full = XGBClassifier(**p)
-    xgb_full.fit(Xtr_tree, ytr, eval_set=[(Xva_tree, yva)], eval_metric="auc",
-                 verbose=False, early_stopping_rounds=150)
-    out["XGBoost"] = xgb_full
-
-    # LightGBM
-    p = models["Light GBM"].get_params().copy(); p["random_state"]=seed
-    try:
-        lgb_full = LGBMClassifier(**p)
-        try:
-            es_cb = lgb.early_stopping(150, first_metric_only=False, verbose=False)
-            lgb_full.fit(Xtr_tree, ytr, eval_set=[(Xva_tree, yva)], eval_metric="auc",
-                         callbacks=[es_cb], verbose=False)
-        except Exception:
-            lgb_full.fit(Xtr_tree, ytr, eval_set=[(Xva_tree, yva)], eval_metric="auc",
-                         early_stopping_rounds=150, verbose=False)
-    except LightGBMError as e:
-        if "bad allocation" in str(e).lower():
-            # fallback: smaller training set for ES
-            Xsub, ysub = _stratified_subsample(Xtr_tree, ytr, n_max=900_000, seed=seed)
-            lgb_full = LGBMClassifier(**p)
-            try:
-                es_cb = lgb.early_stopping(150, first_metric_only=False, verbose=False)
-                lgb_full.fit(Xsub, ysub, eval_set=[(Xva_tree, yva)], eval_metric="auc",
-                             callbacks=[es_cb], verbose=False)
-            except Exception:
-                lgb_full.fit(Xsub, ysub, eval_set=[(Xva_tree, yva)], eval_metric="auc",
-                             early_stopping_rounds=150, verbose=False)
-        else:
-            raise
-    out["Light GBM"] = lgb_full
-
-    # HGB (trees like UNscaled)
-    hgb = models["Gradient Boosting"].get_params().copy()
-    hgb.pop("early_stopping", None); hgb.pop("validation_fraction", None)
-    hgb_full = HistGradientBoostingClassifier(**hgb, random_state=seed)
-    hgb_full.fit(Xtr_tree, ytr)  # its own internal ES was used during quick tuning
-    out["Gradient Boosting"] = hgb_full
-
-    # MLP (use SCALED)
-    p = models["Neural Network"].get_params().copy(); p["random_state"]=seed
-    p.update({"early_stopping": True, "n_iter_no_change": 8, "max_iter": max(100, p.get("max_iter", 80))})
-    mlp_full = MLPClassifier(**p)
-    mlp_full.fit(Xtr_s, ytr)  # ES on 10% internal
-    out["Neural Network"] = mlp_full
-
-    return out
-
-# -----------------
-# evaluation
-# -----------------
-def proba(model, X):
-    if hasattr(model, "predict_proba"): return model.predict_proba(X)[:, 1]
-    if hasattr(model, "decision_function"):
-        s = model.decision_function(X); s = (s - s.min())/(s.max()-s.min()+1e-12); return s
-    return model.predict(X)
-
-def evaluate_suite(models, X_test_tree, X_test_scaled, y_test):
-    rows, roc_data = [], {}
-    view = {
-        "Logistic Regression": ("scaled", models["Logistic Regression"]),
-        "Decision Tree": ("tree", models["Decision Tree"]),
-        "K Nearest Neighbors": ("scaled", models["K Nearest Neighbors"]),
-        "Random Forest": ("tree", models["Random Forest"]),
-        "Gaussian Naive Bayes": ("scaled", models["Gaussian Naive Bayes"]),
-        "Light GBM": ("tree", models["Light GBM"]),
-        "XGBoost": ("tree", models["XGBoost"]),
-        "Gradient Boosting": ("tree", models["Gradient Boosting"]),
-        "Neural Network": ("scaled", models["Neural Network"]),
-    }
-    for name, (space, mdl) in view.items():
-        Xt = X_test_scaled if space=="scaled" else X_test_tree
-        p = proba(mdl, Xt)
-        y_pred = (p >= 0.5).astype(int)
-        acc = accuracy_score(y_test, y_pred)
-        auc = roc_auc_score(y_test, p)
-        ks  = sps.ks_2samp(p[y_test==1], p[y_test==0]).statistic
-        prec= precision_score(y_test, y_pred); rec = recall_score(y_test, y_pred)
-        f1  = f1_score(y_test, y_pred); cm = confusion_matrix(y_test, y_pred)
-        fpr, tpr, _ = roc_curve(y_test, p)
-        rows.append({'Model': name, 'Accuracy': acc, 'AUC': auc, 'KS': ks,
-                     'Precision': prec, 'Recall': rec, 'F1-Score': f1})
-        roc_data[name] = (fpr, tpr, auc)
-        print(f"\n{name}\n{cm}")
-    return pd.DataFrame(rows), roc_data
-
-def plot_roc(roc_data):
-    plt.figure(figsize=(10, 8))
-    for name, (fpr, tpr, auc) in roc_data.items():
-        plt.plot(fpr, tpr, label=f'{name} (AUC={auc:.3f})')
-    plt.plot([0,1],[0,1],'k--'); plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title('ROC')
-    plt.legend(loc='lower right'); plt.grid(True); plt.show()
-
-# =========================
-# ==== RUN PIPELINE =======
-# (Assumes X_train, y_train, X_test, y_test already exist)
-# =========================
-
-# 1) Build two feature spaces
-X_train_tree = _asfloat32_contig(X_train)   # UNscaled for trees/boosters
-X_test_tree  = _asfloat32_contig(X_test)
-scaler = StandardScaler().fit(X_train)      # scaled for MLP/LogReg/KNN
-X_train_scaled = scaler.transform(X_train)
-X_test_scaled  = scaler.transform(X_test)
-
-# 2) Baselines (placeholders; boosters/MLP will be overwritten)
 models = {
-    'Logistic Regression': LogisticRegression(solver='saga', max_iter=1000, n_jobs=8, random_state=SEED),
+    'Logistic Regression': LogisticRegression(random_state=SEED),
     'Decision Tree': DecisionTreeClassifier(max_depth=10, random_state=SEED),
-    'K Nearest Neighbors': KNeighborsClassifier(n_neighbors=20, n_jobs=8),
-    'Random Forest': RandomForestClassifier(n_estimators=100, max_depth=10, n_jobs=8, random_state=SEED),
-    'Gaussian Naive Bayes': GaussianNB(),
+    'K Nearest Neighbors': KNeighborsClassifier(n_neighbors=20), 
+        # KNN doesn't use random_state, but watch for tie-breaking
+    'Random Forest': RandomForestClassifier(n_estimators=20, max_depth=10, random_state=SEED),
+    'Gaussian Naive Bayes': GaussianNB(),  # no random_state here
     'Light GBM': LGBMClassifier(n_estimators=50, max_depth=3, random_state=SEED),
-    'XGBoost': XGBClassifier(n_estimators=50, max_depth=3, tree_method="hist", eval_metric="auc", random_state=SEED),
-    'Gradient Boosting': HistGradientBoostingClassifier(max_iter=50, random_state=SEED),
-    'Neural Network': MLPClassifier(hidden_layer_sizes=(10,10), random_state=SEED)
+    'XGBoost': XGBClassifier(n_estimators=50, max_depth=3, random_state=SEED),
+    'Gradient Boosting': GradientBoostingClassifier(n_estimators=50, max_depth=3, random_state=SEED),
+    'Neural Network': MLPClassifier(hidden_layer_sizes=(10, 10), random_state=SEED)
 }
 
-# 3) Tune on subset (UNscaled for trees, SCALED for MLP)
-tuned = build_tuned_models(X_train_tree, y_train, X_train_scaled, seed=SEED)
 
-# 4) Refit with ES on a 90/10 split from FULL train; keep the ES models
-fitted = refit_with_es(tuned, X_train_tree, X_train_scaled, y_train, seed=SEED)
+# Evaluate Models on Pre-Split Data (Using Cleaned Versions)
+results_df = fit_models_summary(models, X_train, y_train, X_test, y_test)
 
-# 5) Replace placeholders with fitted tuned models
-models.update({
-    'Light GBM': fitted['Light GBM'],
-    'XGBoost': fitted['XGBoost'],
-    'Gradient Boosting': fitted['Gradient Boosting'],
-    'Neural Network': fitted['Neural Network'],
-})
+# Display Results
+print(results_df)
 
-# 6) Also fit the simple baselines now (so they’re trained before eval)
-models['Logistic Regression'].fit(X_train_scaled, y_train)
-models['Decision Tree'].fit(X_train_tree, y_train)
-models['K Nearest Neighbors'].fit(X_train_scaled, y_train)
-models['Random Forest'].fit(X_train_tree, y_train)
-models['Gaussian Naive Bayes'].fit(X_train_scaled, y_train)
 
-# 7) Evaluate (AUC/ROC computed on the right feature space per model)
-results_df, roc_data = evaluate_suite(models, X_test_tree, X_test_scaled, y_test)
-print("\n=== Final results (AUC-focused; ES on full-train split; trees on UNscaled) ===")
-print(results_df.to_string(index=False))
-plot_roc(roc_data)
 
-# 8) (Optional) print compact hyperparams for tuned models
-def _fmt(x): 
-    try: return int(x)
-    except: return x
-def summarize(models_dict):
-    rows=[]
-    for name in ['Light GBM','XGBoost','Neural Network','Gradient Boosting',
-                 'Random Forest','Logistic Regression','Decision Tree','K Nearest Neighbors','Gaussian Naive Bayes']:
-        m=models_dict[name]
-        if name=='Light GBM':
-            p=m.get_params()
-            rows.append([name, f"trees={_fmt(p.get('n_estimators'))}, num_leaves={_fmt(p.get('num_leaves'))}, lr={p.get('learning_rate')}"])
-        elif name=='XGBoost':
-            p=m.get_params()
-            rows.append([name, f"trees={_fmt(p.get('n_estimators'))}, max_depth={_fmt(p.get('max_depth'))}, lr={p.get('learning_rate')}"])
-        elif name=='Neural Network':
-            p=m.get_params()
-            rows.append([name, f"hls={p.get('hidden_layer_sizes')}, alpha={p.get('alpha')}, batch={p.get('batch_size')}"])
-        elif name=='Gradient Boosting':
-            p=m.get_params(); rows.append([name, f"max_iter={_fmt(p.get('max_iter'))}, max_depth={_fmt(p.get('max_depth'))}"])
-        elif name=='Random Forest':
-            p=m.get_params(); rows.append([name, f"trees={_fmt(p.get('n_estimators'))}, max_depth={_fmt(p.get('max_depth'))}"])
-        elif name=='Logistic Regression':
-            p=m.get_params(); rows.append([name, f"solver={p.get('solver')}, max_iter={_fmt(p.get('max_iter'))}"])
-        elif name=='Decision Tree':
-            p=m.get_params(); rows.append([name, f"max_depth={_fmt(p.get('max_depth'))}"])
-        elif name=='K Nearest Neighbors':
-            p=m.get_params(); rows.append([name, f"k={_fmt(p.get('n_neighbors'))}"])
-        else:
-            rows.append([name, "default"])
-    return pd.DataFrame(rows, columns=["Algorithm","Key Hyperparameters"])
-print("\nChosen/Tuned Hyperparameters")
-print(summarize(models).to_string(index=False))
+
+
+
+
+# Required imports
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+import scipy.stats as sps
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neighbors import KNeighborsClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+
+
+
+# Confusion Matrix Plotting Function (unchanged from your original)
+def plot_confusion_matrix(mean_conf_matrix, xtick_labels=None, ytick_labels=None):
+    """
+    Plot the confusion matrix as a heatmap.
+    """
+    fig, axes = plt.subplots(figsize=(8, 6))
+    ax = sns.heatmap(mean_conf_matrix.T, annot=True, cmap='Blues', fmt=".1f", annot_kws={"size": 18})
+    if xtick_labels:
+        ax.set_xticklabels(xtick_labels)
+    if ytick_labels:
+        ax.set_yticklabels(ytick_labels)
+    ax.set_xlabel('True Label')
+    ax.set_ylabel('Predicted Label')
+    plt.title('Mean Confusion Matrix')
+    plt.show()
+
+# Updated calculate_scores to include ROC data
+def calculate_scores(model, X_trn, y_trn, X_tst, y_tst):
+    """
+    Train a model and calculate various performance metrics on the test set, including ROC curve data.
+    """
+    model.fit(X_trn, y_trn)
+    y_pred = model.predict(X_tst)
+    accuracy = accuracy_score(y_tst, y_pred)
+    conf_matrix = confusion_matrix(y_tst, y_pred)
+    precision = precision_score(y_tst, y_pred)
+    recall = recall_score(y_tst, y_pred)
+    f1 = f1_score(y_tst, y_pred)
+    y_pred_proba = model.predict_proba(X_tst)[:, 1]
+    auc = roc_auc_score(y_tst, y_pred_proba)
+    fpr, tpr, _ = roc_curve(y_tst, y_pred_proba)  # Compute ROC curve data
+    mask = y_tst.astype(bool).values
+    churn = y_pred_proba[mask]
+    not_churn = y_pred_proba[~mask]
+    ks = sps.ks_2samp(churn, not_churn)[0]
+    return accuracy, auc, ks, conf_matrix, precision, recall, f1, fpr, tpr
+
+# Updated fit_models_summary to return ROC data
+def fit_models_summary(models, X_train, y_train, X_test, y_test):
+    """
+    Evaluate multiple models on pre-split training and testing data, including ROC curve data.
+    """
+    results = []
+    roc_data = {}
+    for name, model in models.items():
+        print(f"Evaluating {name}...")
+        accuracy, auc, ks, conf_matrix, precision, recall, f1, fpr, tpr = calculate_scores(model, X_train, y_train, X_test, y_test)
+        results.append({'Model': name, 'Accuracy': accuracy, 'AUC': auc, 'KS': ks, 
+                        'Precision': precision, 'Recall': recall, 'F1-Score': f1})
+        roc_data[name] = (fpr, tpr, auc)
+        print(f"Model: {name}")
+        print(f"Confusion Matrix:\n{conf_matrix}\n")
+    return pd.DataFrame(results), roc_data
+
+# ROC Curve Plotting Function
+def plot_roc_curves(roc_data):
+    """
+    Plot ROC curves for all models on a single graph.
+    """
+    plt.figure(figsize=(10, 8))
+    for model_name, (fpr, tpr, auc) in roc_data.items():
+        plt.plot(fpr, tpr, label=f'{model_name} (AUC = {auc:.3f})')
+    plt.plot([0, 1], [0, 1], 'k--', label='Random Guess (AUC = 0.5)')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curves for Loan Default Prediction Models')
+    plt.legend(loc='lower right')
+    plt.grid(True)
+    plt.show()
+
+# Define Models (this was missing in your error context)
+models = {
+    'Logistic Regression': LogisticRegression(random_state=SEED),
+    'Decision Tree': DecisionTreeClassifier(max_depth=10, random_state=SEED),
+    'K Nearest Neighbors': KNeighborsClassifier(n_neighbors=20),
+    'Random Forest': RandomForestClassifier(n_estimators=20, max_depth=10, random_state=SEED),
+    'Gaussian Naive Bayes': GaussianNB(),
+    'Light GBM': LGBMClassifier(n_estimators=50, max_depth=3, random_state=SEED),
+    'XGBoost': XGBClassifier(n_estimators=50, max_depth=3, random_state=SEED),
+    'Gradient Boosting': GradientBoostingClassifier(n_estimators=50, max_depth=3, random_state=SEED),
+    'Neural Network': MLPClassifier(hidden_layer_sizes=(10, 10), random_state=SEED)
+}
+
+# Assuming X_train, y_train, X_test, y_test are already defined
+# Evaluate models and get results + ROC data
+results_df, roc_data = fit_models_summary(models, X_train, y_train, X_test, y_test)
+
+# Display the results table
+print(results_df)
+
+# Plot ROC curves
+plot_roc_curves(roc_data)

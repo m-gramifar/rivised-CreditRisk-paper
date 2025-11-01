@@ -1,214 +1,277 @@
-from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score, f1_score, roc_auc_score
-import scipy.stats as sps
+"""Model evaluation utilities for Lending Club credit risk experiments."""
 
+from __future__ import annotations
 
-# Confusion Matrix Plotting Function
-def plot_confusion_matrix(mean_conf_matrix, xtick_labels=None, ytick_labels=None):
-    """
-    Plot the confusion matrix as a heatmap.
-    """
-    fig, axes = plt.subplots(figsize=(8, 6))
-    ax = sns.heatmap(mean_conf_matrix.T, annot=True, cmap='Blues', fmt=".1f", annot_kws={"size": 18})
-    if xtick_labels:
-        ax.set_xticklabels(xtick_labels)
-    if ytick_labels:
-        ax.set_yticklabels(ytick_labels)
+from typing import Dict, Iterable, Tuple
 
-    ax.set_xlabel('True Label')
-    ax.set_ylabel('Predicted Label')
-    plt.title('Mean Confusion Matrix')
-    plt.show()
-
-# Function to Calculate Metrics
-def calculate_scores(model, X_trn, y_trn, X_tst, y_tst):
-    """
-    Train a model and calculate various performance metrics on the test set.
-    """
-    model.fit(X_trn, y_trn)
-    y_pred = model.predict(X_tst)
-    accuracy = accuracy_score(y_tst, y_pred)
-
-    # Confusion matrix
-    conf_matrix = confusion_matrix(y_tst, y_pred)
-
-    # Precision, recall, F1-score
-    precision = precision_score(y_tst, y_pred)
-    recall = recall_score(y_tst, y_pred)
-    f1 = f1_score(y_tst, y_pred)
-
-    # AUC score
-    y_pred_proba = model.predict_proba(X_tst)[:, 1]
-    auc = roc_auc_score(y_tst, y_pred_proba)
-
-    # KS statistic
-    mask = y_tst.astype(bool).values
-    churn = y_pred_proba[mask]
-    not_churn = y_pred_proba[~mask]
-    ks = sps.ks_2samp(churn, not_churn)[0]
-
-    return accuracy, auc, ks, conf_matrix, precision, recall, f1
-
-# Function to Evaluate Models
-def fit_models_summary(models, X_train, y_train, X_test, y_test):
-    """
-    Evaluate multiple models on pre-split training and testing data.
-    """
-    results = []
-    for name, model in models.items():
-        print(f"Evaluating {name}...")
-        accuracy, auc, ks, conf_matrix, precision, recall, f1 = calculate_scores(model, X_train, y_train, X_test, y_test)
-
-        # Store results
-        results.append({'Model': name, 'Accuracy': accuracy, 'AUC': auc, 'KS': ks, 
-                        'Precision': precision, 'Recall': recall, 'F1-Score': f1})
-        print(f"Model: {name}")
-        print(f"Confusion Matrix:\n{conf_matrix}\n")
-
-    return pd.DataFrame(results)
-
-# Define Models
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.neural_network import MLPClassifier
-from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
-from sklearn.naive_bayes import GaussianNB
-from sklearn.neighbors import KNeighborsClassifier
-
-models = {
-    'Logistic Regression': LogisticRegression(random_state=SEED),
-    'Decision Tree': DecisionTreeClassifier(max_depth=10, random_state=SEED),
-    'K Nearest Neighbors': KNeighborsClassifier(n_neighbors=20), 
-        # KNN doesn't use random_state, but watch for tie-breaking
-    'Random Forest': RandomForestClassifier(n_estimators=20, max_depth=10, random_state=SEED),
-    'Gaussian Naive Bayes': GaussianNB(),  # no random_state here
-    'Light GBM': LGBMClassifier(n_estimators=50, max_depth=3, random_state=SEED),
-    'XGBoost': XGBClassifier(n_estimators=50, max_depth=3, random_state=SEED),
-    'Gradient Boosting': GradientBoostingClassifier(n_estimators=50, max_depth=3, random_state=SEED),
-    'Neural Network': MLPClassifier(hidden_layer_sizes=(10, 10), random_state=SEED)
-}
-
-
-# Evaluate Models on Pre-Split Data (Using Cleaned Versions)
-results_df = fit_models_summary(models, X_train, y_train, X_test, y_test)
-
-# Display Results
-print(results_df)
-
-
-
-
-
-
-
-# Required imports
 import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
 import numpy as np
-from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+import pandas as pd
+import seaborn as sns
 import scipy.stats as sps
+from lightgbm import LGBMClassifier
+from sklearn.base import clone
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
+
+# Default random seed used across all estimators.  This keeps experiments reproducible
+# while still allowing the caller to override the value before importing this module.
+SEED = 42
 
 
+def plot_confusion_matrix(
+    mean_conf_matrix: np.ndarray,
+    xtick_labels: Iterable[str] | None = None,
+    ytick_labels: Iterable[str] | None = None,
+) -> None:
+    """Plot the confusion matrix as a heatmap."""
 
-# Confusion Matrix Plotting Function (unchanged from your original)
-def plot_confusion_matrix(mean_conf_matrix, xtick_labels=None, ytick_labels=None):
-    """
-    Plot the confusion matrix as a heatmap.
-    """
     fig, axes = plt.subplots(figsize=(8, 6))
-    ax = sns.heatmap(mean_conf_matrix.T, annot=True, cmap='Blues', fmt=".1f", annot_kws={"size": 18})
+    ax = sns.heatmap(
+        mean_conf_matrix.T,
+        annot=True,
+        cmap="Blues",
+        fmt=".1f",
+        annot_kws={"size": 18},
+    )
     if xtick_labels:
-        ax.set_xticklabels(xtick_labels)
+        ax.set_xticklabels(list(xtick_labels))
     if ytick_labels:
-        ax.set_yticklabels(ytick_labels)
-    ax.set_xlabel('True Label')
-    ax.set_ylabel('Predicted Label')
-    plt.title('Mean Confusion Matrix')
+        ax.set_yticklabels(list(ytick_labels))
+
+    ax.set_xlabel("True Label")
+    ax.set_ylabel("Predicted Label")
+    plt.title("Mean Confusion Matrix")
     plt.show()
 
-# Updated calculate_scores to include ROC data
+
+def _train_with_optional_early_stopping(
+    model, X_trn: pd.DataFrame, y_trn: pd.Series
+) -> Tuple:
+    """Clone and train a model, enabling early stopping where available.
+
+    XGBoost and LightGBM benefit substantially from early stopping when working
+    with the large Lending Club data set.  To avoid leaking information from the
+    test split, we reserve a small portion of the training data for validation
+    and only train on the remainder when the estimator exposes an early stopping
+    interface.
+    """
+
+    estimator = clone(model)
+    fit_X, fit_y = X_trn, y_trn
+    fit_kwargs: Dict = {}
+
+    if isinstance(estimator, XGBClassifier):
+        fit_X, X_val, fit_y, y_val = train_test_split(
+            X_trn,
+            y_trn,
+            test_size=0.1,
+            stratify=y_trn,
+            random_state=SEED,
+        )
+        fit_kwargs = {
+            "eval_set": [(X_val, y_val)],
+            "early_stopping_rounds": 50,
+            "verbose": False,
+        }
+    elif isinstance(estimator, LGBMClassifier):
+        fit_X, X_val, fit_y, y_val = train_test_split(
+            X_trn,
+            y_trn,
+            test_size=0.1,
+            stratify=y_trn,
+            random_state=SEED,
+        )
+        fit_kwargs = {
+            "eval_set": [(X_val, y_val)],
+            "eval_metric": "auc",
+            "early_stopping_rounds": 50,
+            "verbose": -1,
+        }
+
+    estimator.fit(fit_X, fit_y, **fit_kwargs)
+    return estimator
+
+
 def calculate_scores(model, X_trn, y_trn, X_tst, y_tst):
-    """
-    Train a model and calculate various performance metrics on the test set, including ROC curve data.
-    """
-    model.fit(X_trn, y_trn)
-    y_pred = model.predict(X_tst)
+    """Train a model and calculate various performance metrics on the test set."""
+
+    estimator = _train_with_optional_early_stopping(model, X_trn, y_trn)
+    y_pred = estimator.predict(X_tst)
     accuracy = accuracy_score(y_tst, y_pred)
+
     conf_matrix = confusion_matrix(y_tst, y_pred)
     precision = precision_score(y_tst, y_pred)
     recall = recall_score(y_tst, y_pred)
     f1 = f1_score(y_tst, y_pred)
-    y_pred_proba = model.predict_proba(X_tst)[:, 1]
+
+    y_pred_proba = estimator.predict_proba(X_tst)[:, 1]
     auc = roc_auc_score(y_tst, y_pred_proba)
-    fpr, tpr, _ = roc_curve(y_tst, y_pred_proba)  # Compute ROC curve data
+    fpr, tpr, _ = roc_curve(y_tst, y_pred_proba)
+
     mask = y_tst.astype(bool).values
     churn = y_pred_proba[mask]
     not_churn = y_pred_proba[~mask]
     ks = sps.ks_2samp(churn, not_churn)[0]
+
     return accuracy, auc, ks, conf_matrix, precision, recall, f1, fpr, tpr
 
-# Updated fit_models_summary to return ROC data
+
 def fit_models_summary(models, X_train, y_train, X_test, y_test):
-    """
-    Evaluate multiple models on pre-split training and testing data, including ROC curve data.
-    """
+    """Evaluate multiple models on pre-split training and testing data."""
+
     results = []
     roc_data = {}
     for name, model in models.items():
         print(f"Evaluating {name}...")
-        accuracy, auc, ks, conf_matrix, precision, recall, f1, fpr, tpr = calculate_scores(model, X_train, y_train, X_test, y_test)
-        results.append({'Model': name, 'Accuracy': accuracy, 'AUC': auc, 'KS': ks, 
-                        'Precision': precision, 'Recall': recall, 'F1-Score': f1})
+        (
+            accuracy,
+            auc,
+            ks,
+            conf_matrix,
+            precision,
+            recall,
+            f1,
+            fpr,
+            tpr,
+        ) = calculate_scores(model, X_train, y_train, X_test, y_test)
+
+        results.append(
+            {
+                "Model": name,
+                "Accuracy": accuracy,
+                "AUC": auc,
+                "KS": ks,
+                "Precision": precision,
+                "Recall": recall,
+                "F1-Score": f1,
+            }
+        )
         roc_data[name] = (fpr, tpr, auc)
         print(f"Model: {name}")
         print(f"Confusion Matrix:\n{conf_matrix}\n")
+
     return pd.DataFrame(results), roc_data
 
-# ROC Curve Plotting Function
-def plot_roc_curves(roc_data):
-    """
-    Plot ROC curves for all models on a single graph.
-    """
+
+def plot_roc_curves(roc_data: Dict[str, Tuple[np.ndarray, np.ndarray, float]]) -> None:
+    """Plot ROC curves for all models on a single graph."""
+
     plt.figure(figsize=(10, 8))
     for model_name, (fpr, tpr, auc) in roc_data.items():
-        plt.plot(fpr, tpr, label=f'{model_name} (AUC = {auc:.3f})')
-    plt.plot([0, 1], [0, 1], 'k--', label='Random Guess (AUC = 0.5)')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curves for Loan Default Prediction Models')
-    plt.legend(loc='lower right')
+        plt.plot(fpr, tpr, label=f"{model_name} (AUC = {auc:.3f})")
+    plt.plot([0, 1], [0, 1], "k--", label="Random Guess (AUC = 0.5)")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves for Loan Default Prediction Models")
+    plt.legend(loc="lower right")
     plt.grid(True)
     plt.show()
 
-# Define Models (this was missing in your error context)
+
+# Tuned model configurations with stronger depth/regularisation trade-offs.
 models = {
-    'Logistic Regression': LogisticRegression(random_state=SEED),
-    'Decision Tree': DecisionTreeClassifier(max_depth=10, random_state=SEED),
-    'K Nearest Neighbors': KNeighborsClassifier(n_neighbors=20),
-    'Random Forest': RandomForestClassifier(n_estimators=20, max_depth=10, random_state=SEED),
-    'Gaussian Naive Bayes': GaussianNB(),
-    'Light GBM': LGBMClassifier(n_estimators=50, max_depth=3, random_state=SEED),
-    'XGBoost': XGBClassifier(n_estimators=50, max_depth=3, random_state=SEED),
-    'Gradient Boosting': GradientBoostingClassifier(n_estimators=50, max_depth=3, random_state=SEED),
-    'Neural Network': MLPClassifier(hidden_layer_sizes=(10, 10), random_state=SEED)
+    "Logistic Regression": Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                LogisticRegression(
+                    max_iter=1000,
+                    class_weight="balanced",
+                    random_state=SEED,
+                ),
+            ),
+        ]
+    ),
+    "Decision Tree": DecisionTreeClassifier(
+        max_depth=12,
+        min_samples_leaf=50,
+        random_state=SEED,
+    ),
+    "K Nearest Neighbors": Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            ("model", KNeighborsClassifier(n_neighbors=50, weights="distance")),
+        ]
+    ),
+    "Random Forest": RandomForestClassifier(
+        n_estimators=400,
+        max_depth=12,
+        min_samples_leaf=50,
+        n_jobs=-1,
+        random_state=SEED,
+    ),
+    "Gaussian Naive Bayes": GaussianNB(),
+    "Gradient Boosting": GradientBoostingClassifier(
+        n_estimators=400,
+        learning_rate=0.05,
+        max_depth=3,
+        random_state=SEED,
+    ),
+    "Light GBM": LGBMClassifier(
+        n_estimators=1000,
+        learning_rate=0.05,
+        num_leaves=63,
+        max_depth=-1,
+        subsample=0.8,
+        subsample_freq=1,
+        colsample_bytree=0.8,
+        min_child_samples=100,
+        reg_lambda=1.0,
+        random_state=SEED,
+        n_jobs=-1,
+    ),
+    "XGBoost": XGBClassifier(
+        n_estimators=800,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        reg_lambda=1.0,
+        tree_method="hist",
+        n_jobs=-1,
+        eval_metric="auc",
+        random_state=SEED,
+        use_label_encoder=False,
+    ),
+    "Neural Network": Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            (
+                "mlp",
+                MLPClassifier(
+                    hidden_layer_sizes=(128, 64, 32),
+                    activation="relu",
+                    alpha=1e-3,
+                    batch_size=512,
+                    learning_rate_init=0.001,
+                    max_iter=200,
+                    early_stopping=True,
+                    validation_fraction=0.1,
+                    n_iter_no_change=15,
+                    random_state=SEED,
+                ),
+            ),
+        ]
+    ),
 }
 
-# Assuming X_train, y_train, X_test, y_test are already defined
-# Evaluate models and get results + ROC data
-results_df, roc_data = fit_models_summary(models, X_train, y_train, X_test, y_test)
-
-# Display the results table
-print(results_df)
-
-# Plot ROC curves
-plot_roc_curves(roc_data)
